@@ -153,8 +153,8 @@ pub struct SharedRuntimeArgs {
     ///
     /// * "auto" detects the format from the template
     /// * "string" renders content as a string. Example: `"Hello World"`
-    /// * "openai" renders content as a list of dictionaries, similar to OpenAI schema. Example:
-    ///   `[{"type": "text", "text": "Hello world!"}]`
+    /// * "openai" renders content as a list of dictionaries, similar to OpenAI
+    ///   schema. Example: `[{"type": "text", "text": "Hello world!"}]`
     #[arg(long, default_value_t)]
     #[serde(default)]
     pub chat_template_content_format: ChatTemplateContentFormatOption,
@@ -164,6 +164,16 @@ pub struct SharedRuntimeArgs {
     #[arg(long)]
     #[serde(default)]
     pub enable_log_requests: bool,
+
+    /// If specified, API server will add X-Request-Id header to responses.
+    #[arg(
+        long,
+        visible_alias = "no-enable-request-id-headers",
+        default_missing_value = "true",
+        num_args = 0..=1
+    )]
+    #[serde(default)]
+    pub enable_request_id_headers: bool,
 
     /// Disable periodic logging of engine statistics (throughput, queue depth,
     /// cache usage).
@@ -238,6 +248,7 @@ impl SharedRuntimeArgs {
             default_chat_template_kwargs: self.default_chat_template_kwargs,
             chat_template_content_format: self.chat_template_content_format,
             enable_log_requests: self.enable_log_requests,
+            enable_request_id_headers: self.enable_request_id_headers,
             disable_log_stats: self.disable_log_stats,
             grpc_port: self.grpc_port,
             shutdown_timeout,
@@ -278,6 +289,7 @@ impl SharedRuntimeArgs {
             default_chat_template_kwargs: self.default_chat_template_kwargs,
             chat_template_content_format: self.chat_template_content_format,
             enable_log_requests: self.enable_log_requests,
+            enable_request_id_headers: self.enable_request_id_headers,
             disable_log_stats: self.disable_log_stats,
             grpc_port: self.grpc_port,
             shutdown_timeout,
