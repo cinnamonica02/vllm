@@ -15,7 +15,7 @@ use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context as _, Result};
 use axum::{Router, serve::ListenerExt as _};
-pub use config::{Config, CoordinatorMode, HttpListenerMode};
+pub use config::{Config, CoordinatorMode, CorsConfig, HttpListenerMode};
 use tokio::net::TcpListener;
 use tokio::time::{Instant, sleep_until};
 use tokio_stream::wrappers::TcpListenerStream;
@@ -30,7 +30,7 @@ use vllm_llm::Llm;
 use vllm_text::TextLlm;
 
 use crate::listener::Listener;
-use crate::routes::build_router;
+use crate::routes::{apply_cors, build_router};
 use crate::server_info::ServerInfoSnapshot;
 use crate::state::AppState;
 
@@ -129,6 +129,7 @@ where
     let bind_address = listener.local_addr()?;
     let model = state.primary_model_name().to_owned();
     let app = extend_router(build_router(state.clone()));
+    let app = apply_cors(app, &config.cors);
 
     // Optionally bind the gRPC Generate server on a separate port. Bind
     // synchronously here so bind errors (port in use, permission denied, ...)

@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
+use axum::http::{HeaderName, HeaderValue, Method};
 use serde::Serialize;
 use serde_json::Value;
 use vllm_chat::{ChatTemplateContentFormatOption, ParserSelection, RendererSelection};
@@ -30,6 +31,53 @@ pub enum CoordinatorMode {
     MaybeInProc,
     /// Connect to an external coordinator owned by another process.
     External { address: String },
+}
+
+/// CORS policy for the HTTP server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CorsConfig {
+    /// Whether browser clients may include credentials in cross-origin
+    /// requests.
+    pub allow_credentials: bool,
+    /// Allowed origins. A single `"*"` matches any origin.
+    pub allowed_origins: Vec<String>,
+    /// Allowed HTTP methods. A single `"*"` matches any method.
+    pub allowed_methods: Vec<String>,
+    /// Allowed request headers. A single `"*"` matches any header.
+    pub allowed_headers: Vec<String>,
+}
+
+impl Default for CorsConfig {
+    fn default() -> Self {
+        Self {
+            allow_credentials: false,
+            allowed_origins: wildcard_list(),
+            allowed_methods: wildcard_list(),
+            allowed_headers: wildcard_list(),
+        }
+    }
+}
+
+impl CorsConfig {
+    /// Validate CORS values before server startup.
+    pub fn validate(&self) -> Result<()> {
+        if self.allow_credentials {
+            if has_wildcard(&self.allowed_origins) {
+                bail!("cannot use wildcard CORS origin when allow_credentials is true");
+            }
+            if has_wildcard(&self.allowed_methods) {
+                bail!("cannot use wildcard CORS methods when allow_credentials is true");
+            }
+            if has_wildcard(&self.allowed_headers) {
+                bail!("cannot use wildcard CORS headers when allow_credentials is true");
+            }
+        }
+
+        validate_origins(&self.allowed_origins)?;
+        validate_methods(&self.allowed_methods)?;
+        validate_headers(&self.allowed_headers)?;
+        Ok(())
+    }
 }
 
 /// Normalized runtime configuration for the minimal OpenAI-compatible server.
@@ -67,6 +115,8 @@ pub struct Config {
     /// When `true`, suppress periodic stats logging (throughput, queue depth,
     /// cache usage).
     pub disable_log_stats: bool,
+    /// CORS policy for browser-based clients.
+    pub cors: CorsConfig,
     /// TCP port for the gRPC Generate service. When `None`, no gRPC server is
     /// started.
     pub grpc_port: Option<u16>,
@@ -79,6 +129,7 @@ impl Config {
     /// startup.
     pub fn validate(&self) -> Result<()> {
         vllm_chat::validate_parser_overrides(&self.tool_call_parser, &self.reasoning_parser)?;
+        self.cors.validate()?;
 
         Ok(())
     }
@@ -109,5 +160,123 @@ impl Config {
                 address: address.clone(),
             }),
         }
+    }
+}
+
+fn wildcard_list() -> Vec<String> {
+    vec!["*".to_string()]
+}
+
+fn has_wildcard(values: &[String]) -> bool {
+    values.iter().any(|value| value == "*")
+}
+
+fn validate_origins(origins: &[String]) -> Result<()> {
+    for origin in origins {
+        if origin == "*" {
+            continue;
+        }
+        HeaderValue::from_str(origin)
+            .map_err(|err| anyhow::anyhow!("invalid CORS origin `{origin}`: {err}"))?;
+    }
+    Ok(())
+}
+
+fn validate_methods(methods: &[String]) -> Result<()> {
+    for method in methods {
+        if method == "*" {
+            continue;
+        }
+        Method::from_bytes(method.as_bytes())
+            .map_err(|err| anyhow::anyhow!("invalid CORS method `{method}`: {err}"))?;
+    }
+    Ok(())
+}
+
+fn validate_headers(headers: &[String]) -> Result<()> {
+    for header in headers {
+        if header == "*" {
+            continue;
+        }
+        HeaderName::from_bytes(header.as_bytes())
+            .map_err(|err| anyhow::anyhow!("invalid CORS header `{header}`: {err}"))?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CorsConfig;
+
+    #[test]
+    fn cors_config_default_matches_python_defaults() {
+        assert_eq!(
+            CorsConfig::default(),
+            CorsConfig {
+                allow_credentials: false,
+                allowed_origins: vec!["*".to_string()],
+                allowed_methods: vec!["*".to_string()],
+                allowed_headers: vec!["*".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn cors_config_rejects_wildcard_values_with_credentials() {
+        let error = CorsConfig {
+            allow_credentials: true,
+            allowed_origins: vec!["*".to_string()],
+            allowed_methods: vec!["*".to_string()],
+            allowed_headers: vec!["*".to_string()],
+        }
+        .validate()
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "cannot use wildcard CORS origin when allow_credentials is true"
+        );
+
+        let error = CorsConfig {
+            allow_credentials: true,
+            allowed_origins: vec!["https://example.com".to_string()],
+            allowed_methods: vec!["*".to_string()],
+            allowed_headers: vec!["authorization".to_string()],
+        }
+        .validate()
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "cannot use wildcard CORS methods when allow_credentials is true"
+        );
+
+        let error = CorsConfig {
+            allow_credentials: true,
+            allowed_origins: vec!["https://example.com".to_string()],
+            allowed_methods: vec!["POST".to_string()],
+            allowed_headers: vec!["*".to_string()],
+        }
+        .validate()
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "cannot use wildcard CORS headers when allow_credentials is true"
+        );
+    }
+
+    #[test]
+    fn cors_config_rejects_invalid_values() {
+        let error = CorsConfig {
+            allow_credentials: false,
+            allowed_origins: vec!["bad\norigin".to_string()],
+            allowed_methods: vec!["GET".to_string()],
+            allowed_headers: vec!["content-type".to_string()],
+        }
+        .validate()
+        .unwrap_err();
+
+        assert!(error.to_string().contains("invalid CORS origin"));
     }
 }

@@ -13,10 +13,13 @@ mod version;
 use std::sync::Arc;
 
 use axum::Router;
+use axum::http::{HeaderName, HeaderValue, Method};
 use axum::middleware::{from_fn, from_fn_with_state};
 use axum::routing::{get, post};
+use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 
+use crate::config::CorsConfig;
 use crate::middleware;
 use crate::state::AppState;
 
@@ -40,6 +43,56 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         server_dev_mode_enabled(),
         runtime_lora_updating_enabled(),
     )
+}
+
+pub(crate) fn apply_cors(router: Router, cors: &CorsConfig) -> Router {
+    router.layer(cors_layer(cors))
+}
+
+fn cors_layer(cors: &CorsConfig) -> CorsLayer {
+    let layer = CorsLayer::new()
+        .allow_origin(cors_origins(&cors.allowed_origins))
+        .allow_methods(cors_methods(&cors.allowed_methods))
+        .allow_headers(cors_headers(&cors.allowed_headers));
+
+    if cors.allow_credentials {
+        layer.allow_credentials(true)
+    } else {
+        layer
+    }
+}
+
+fn cors_origins(origins: &[String]) -> AllowOrigin {
+    if origins.iter().any(|origin| origin == "*") {
+        AllowOrigin::any()
+    } else {
+        AllowOrigin::list(origins.iter().map(|origin| {
+            HeaderValue::from_str(origin)
+                .expect("CORS origins should be validated before router build")
+        }))
+    }
+}
+
+fn cors_methods(methods: &[String]) -> AllowMethods {
+    if methods.iter().any(|method| method == "*") {
+        AllowMethods::any()
+    } else {
+        AllowMethods::list(methods.iter().map(|method| {
+            Method::from_bytes(method.as_bytes())
+                .expect("CORS methods should be validated before router build")
+        }))
+    }
+}
+
+fn cors_headers(headers: &[String]) -> AllowHeaders {
+    if headers.iter().any(|header| header == "*") {
+        AllowHeaders::any()
+    } else {
+        AllowHeaders::list(headers.iter().map(|header| {
+            HeaderName::from_bytes(header.as_bytes())
+                .expect("CORS headers should be validated before router build")
+        }))
+    }
 }
 
 #[cfg(test)]

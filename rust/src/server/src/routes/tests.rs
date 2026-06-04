@@ -12,7 +12,7 @@ use std::time::Duration;
 use std::{fmt, fs};
 
 use axum::body::{Body, to_bytes};
-use axum::http::{Request, StatusCode};
+use axum::http::{Request, StatusCode, header};
 use bytes::Bytes;
 use futures::StreamExt as _;
 use rmpv::Value;
@@ -43,7 +43,10 @@ use vllm_text::{Prompt, TextBackend};
 use zeromq::prelude::{SocketRecv, SocketSend};
 use zeromq::{DealerSocket, PushSocket, ZmqMessage};
 
-use super::{build_router, build_router_with_dev_mode, build_router_with_dev_mode_and_lora};
+use super::{
+    apply_cors, build_router, build_router_with_dev_mode, build_router_with_dev_mode_and_lora,
+};
+use crate::config::CorsConfig;
 use crate::lora::LoraModelResolution;
 use crate::routes::openai::chat_completions::convert::prepare_chat_request;
 use crate::state::AppState;
@@ -745,6 +748,22 @@ async fn test_app() -> axum::Router {
     test_app_with_dev_mode(false).await
 }
 
+async fn test_app_with_cors(cors: &CorsConfig) -> axum::Router {
+    let (chat, _engine_task) = test_models_with_engine_outputs_and_backend(
+        b"engine-openai",
+        default_stream_output_specs(),
+        Arc::new(FakeChatBackend::new()),
+    )
+    .await;
+    apply_cors(
+        build_router(Arc::new(AppState::new(
+            vec!["Qwen/Qwen1.5-0.5B-Chat".to_string()],
+            chat,
+        ))),
+        cors,
+    )
+}
+
 async fn test_app_with_dev_mode(dev_mode_enabled: bool) -> axum::Router {
     let (chat, _engine_task) = test_models_with_engine_outputs_and_backend(
         b"engine-openai",
@@ -989,6 +1008,21 @@ async fn health_response(app: &axum::Router, request_id: Option<&str>) -> axum::
         .expect("call app")
 }
 
+async fn cors_preflight_response(app: &mut axum::Router, origin: &str) -> axum::response::Response {
+    app.call(
+        Request::builder()
+            .method("OPTIONS")
+            .uri("/v1/chat/completions")
+            .header(header::ORIGIN, origin)
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+            .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "authorization")
+            .body(Body::empty())
+            .expect("build request"),
+    )
+    .await
+    .expect("call app")
+}
+
 fn metric_value(rendered: &str, metric: &str, labels: Option<&str>) -> Option<f64> {
     rendered.lines().find_map(|line| {
         let rest = line.strip_prefix(metric)?;
@@ -1071,6 +1105,47 @@ async fn request_id_header_echoes_incoming_header_when_enabled() {
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers().get("x-request-id").unwrap(), "req-123");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn cors_preflight_allows_configured_origin() {
+    let mut app = test_app_with_cors(&CorsConfig {
+        allow_credentials: true,
+        allowed_origins: vec!["https://example.com".to_string()],
+        allowed_methods: vec!["POST".to_string()],
+        allowed_headers: vec!["authorization".to_string()],
+    })
+    .await;
+
+    let response = cors_preflight_response(&mut app, "https://example.com").await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN).unwrap(),
+        "https://example.com"
+    );
+    assert_eq!(
+        response.headers().get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS).unwrap(),
+        "true"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn cors_rejects_unconfigured_origin() {
+    let mut app = test_app_with_cors(&CorsConfig {
+        allow_credentials: false,
+        allowed_origins: vec!["https://allowed.example".to_string()],
+        allowed_methods: vec!["POST".to_string()],
+        allowed_headers: vec!["authorization".to_string()],
+    })
+    .await;
+
+    let response = cors_preflight_response(&mut app, "https://blocked.example").await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(!response.headers().contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
