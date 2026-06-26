@@ -207,6 +207,19 @@ mod tests {
     }
 
     #[test]
+    fn sampling_range_maps_to_invalid_request() {
+        let error = vllm_text::Error::OutOfRangeSamplingParam {
+            param: "temperature",
+            detail: "must be non-negative, got -1.".into(),
+        };
+        let api_error = text_submit_error("failed to submit completion request", error);
+        assert_eq!(api_error.status_code(), StatusCode::BAD_REQUEST);
+        let response = api_error.to_error_response();
+        assert_eq!(response.error.error_type, "invalid_request_error");
+        assert!(response.error.message.contains("temperature"));
+    }
+
+    #[test]
     fn other_submit_errors_stay_internal() {
         let error = vllm_text::Error::Tokenizer("backend exploded".to_string());
         let api_error = text_submit_error("failed to submit completion request", error);

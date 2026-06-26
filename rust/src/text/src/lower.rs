@@ -104,6 +104,15 @@ pub fn lower_sampling_params(
         vllm_xargs,
     } = sampling_params;
 
+    validate_sampling_param_ranges(
+        temperature,
+        top_p,
+        min_p,
+        frequency_penalty,
+        presence_penalty,
+        repetition_penalty,
+    )?;
+
     validate_logprobs(
         logprobs,
         prompt_logprobs,
@@ -257,6 +266,84 @@ pub fn resolve_max_tokens(
     Ok(request_max_tokens.map_or(model_max_tokens, |n| n.min(model_max_tokens)))
 }
 
+/// Validate user-supplied numeric sampling parameters against the same bounds
+/// Python `SamplingParams._verify_args()` enforces. Only `Some` values are
+/// checked — `None` means "use the model default" and is not validated.
+///
+/// `top_k` is `Option<u32>` so it satisfies `>= -1` by type; no check needed.
+fn validate_sampling_param_ranges(
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    min_p: Option<f32>,
+    frequency_penalty: Option<f32>,
+    presence_penalty: Option<f32>,
+    repetition_penalty: Option<f32>,
+) -> Result<()> {
+    if let Some(v) = temperature {
+        if !v.is_finite() {
+            return Err(Error::OutOfRangeSamplingParam {
+                param: "temperature",
+                detail: format!("must be a finite number, got {v}."),
+            });
+        }
+        if v < 0.0 {
+            return Err(Error::OutOfRangeSamplingParam {
+                param: "temperature",
+                detail: format!("must be non-negative, got {v}."),
+            });
+        }
+        if v > 2.0 {
+            return Err(Error::OutOfRangeSamplingParam {
+                param: "temperature",
+                detail: format!("must be in [0, 2], got {v}."),
+            });
+        }
+    }
+    // top_p lower bound is exclusive: `!(v > 0.0 && v <= 1.0)` correctly rejects NaN.
+    if let Some(v) = top_p {
+        if !(v > 0.0 && v <= 1.0) {
+            return Err(Error::OutOfRangeSamplingParam {
+                param: "top_p",
+                detail: format!("must be in (0, 1], got {v}."),
+            });
+        }
+    }
+    if let Some(v) = min_p {
+        check_inclusive_range("min_p", v, 0.0, 1.0, "must be in [0, 1]")?;
+    }
+    if let Some(v) = frequency_penalty {
+        check_inclusive_range("frequency_penalty", v, -2.0, 2.0, "must be in [-2, 2]")?;
+    }
+    if let Some(v) = presence_penalty {
+        check_inclusive_range("presence_penalty", v, -2.0, 2.0, "must be in [-2, 2]")?;
+    }
+    if let Some(v) = repetition_penalty {
+        if !v.is_finite() {
+            return Err(Error::OutOfRangeSamplingParam {
+                param: "repetition_penalty",
+                detail: format!("must be a finite number, got {v}."),
+            });
+        }
+        if v <= 0.0 {
+            return Err(Error::OutOfRangeSamplingParam {
+                param: "repetition_penalty",
+                detail: format!("must be greater than zero, got {v}."),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn check_inclusive_range(param: &'static str, v: f32, lo: f32, hi: f32, desc: &'static str) -> Result<()> {
+    if !(lo..=hi).contains(&v) {
+        return Err(Error::OutOfRangeSamplingParam {
+            param,
+            detail: format!("{desc}, got {v}."),
+        });
+    }
+    Ok(())
+}
+
 fn merge_unique_token_ids(
     stop_token_ids: &mut Vec<u32>,
     extra_token_ids: impl Iterator<Item = u32>,
@@ -367,6 +454,87 @@ mod tests {
             lower(Some(-2)),
             Err(Error::InvalidThinkingTokenBudget)
         ));
+    }
+
+    #[test]
+    fn lower_sampling_params_rejects_out_of_range() {
+        let check = |params: SamplingParams| {
+            lower_sampling_params_with_limits(params, sample_sampling_limits())
+        };
+
+        // temperature: finite check, then non-negative, then <= 2
+        assert!(matches!(
+            check(SamplingParams { temperature: Some(f32::INFINITY), ..Default::default() }),
+            Err(Error::OutOfRangeSamplingParam { param: "temperature", .. })
+        ));
+        assert!(matches!(
+            check(SamplingParams { temperature: Some(-1.0), ..Default::default() }),
+            Err(Error::OutOfRangeSamplingParam { param: "temperature", .. })
+        ));
+        assert!(matches!(
+            check(SamplingParams { temperature: Some(2.1), ..Default::default() }),
+            Err(Error::OutOfRangeSamplingParam { param: "temperature", .. })
+        ));
+        // temperature: valid edges 0.0 and 2.0 must pass
+        assert!(check(SamplingParams { temperature: Some(0.0), ..Default::default() }).is_ok());
+        assert!(check(SamplingParams { temperature: Some(2.0), ..Default::default() }).is_ok());
+
+        // top_p: exclusive lower bound — 0.0 rejected, 1.0 accepted
+        assert!(matches!(
+            check(SamplingParams { top_p: Some(0.0), ..Default::default() }),
+            Err(Error::OutOfRangeSamplingParam { param: "top_p", .. })
+        ));
+        assert!(matches!(
+            check(SamplingParams { top_p: Some(1.1), ..Default::default() }),
+            Err(Error::OutOfRangeSamplingParam { param: "top_p", .. })
+        ));
+        assert!(check(SamplingParams { top_p: Some(1.0), ..Default::default() }).is_ok());
+
+        // min_p: [0, 1]
+        assert!(matches!(
+            check(SamplingParams { min_p: Some(-0.1), ..Default::default() }),
+            Err(Error::OutOfRangeSamplingParam { param: "min_p", .. })
+        ));
+        assert!(matches!(
+            check(SamplingParams { min_p: Some(1.1), ..Default::default() }),
+            Err(Error::OutOfRangeSamplingParam { param: "min_p", .. })
+        ));
+
+        // frequency_penalty: [-2, 2]
+        assert!(matches!(
+            check(SamplingParams { frequency_penalty: Some(-2.1), ..Default::default() }),
+            Err(Error::OutOfRangeSamplingParam { param: "frequency_penalty", .. })
+        ));
+        assert!(matches!(
+            check(SamplingParams { frequency_penalty: Some(2.1), ..Default::default() }),
+            Err(Error::OutOfRangeSamplingParam { param: "frequency_penalty", .. })
+        ));
+        assert!(check(SamplingParams { frequency_penalty: Some(-2.0), ..Default::default() }).is_ok());
+
+        // presence_penalty: [-2, 2]
+        assert!(matches!(
+            check(SamplingParams { presence_penalty: Some(-2.1), ..Default::default() }),
+            Err(Error::OutOfRangeSamplingParam { param: "presence_penalty", .. })
+        ));
+        assert!(matches!(
+            check(SamplingParams { presence_penalty: Some(2.1), ..Default::default() }),
+            Err(Error::OutOfRangeSamplingParam { param: "presence_penalty", .. })
+        ));
+
+        // repetition_penalty: finite check, then > 0
+        assert!(matches!(
+            check(SamplingParams { repetition_penalty: Some(f32::NAN), ..Default::default() }),
+            Err(Error::OutOfRangeSamplingParam { param: "repetition_penalty", .. })
+        ));
+        assert!(matches!(
+            check(SamplingParams { repetition_penalty: Some(0.0), ..Default::default() }),
+            Err(Error::OutOfRangeSamplingParam { param: "repetition_penalty", .. })
+        ));
+        assert!(matches!(
+            check(SamplingParams { repetition_penalty: Some(-0.5), ..Default::default() }),
+            Err(Error::OutOfRangeSamplingParam { param: "repetition_penalty", .. })
+        ));
+        assert!(check(SamplingParams { repetition_penalty: Some(0.1), ..Default::default() }).is_ok());
     }
 
     #[test]
