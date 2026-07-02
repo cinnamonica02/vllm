@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -664,6 +665,58 @@ impl EngineCoreClient {
                 other => vec![other],
             })
             .collect())
+    }
+
+    /// Initialize the RLHF weight-transfer engine on every connected engine.
+    pub async fn init_weight_transfer_engine(&self, init_info: serde_json::Value) -> Result<()> {
+        let mut kwargs = BTreeMap::new();
+        kwargs.insert("init_info", init_info);
+        self.collective_rpc(
+            "init_weight_transfer_engine",
+            None,
+            Vec::<serde_json::Value>::new(),
+            kwargs,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Start a weight update on every connected engine.
+    pub async fn start_weight_update(&self) -> Result<()> {
+        self.collective_rpc(
+            "start_weight_update",
+            None,
+            Vec::<serde_json::Value>::new(),
+            BTreeMap::<&str, serde_json::Value>::new(),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Push a weight update to every connected engine.
+    pub async fn update_weights(&self, update_info: serde_json::Value) -> Result<()> {
+        let mut kwargs = BTreeMap::new();
+        kwargs.insert("update_info", update_info);
+        self.collective_rpc(
+            "update_weights",
+            None,
+            Vec::<serde_json::Value>::new(),
+            kwargs,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Finish a weight update on every connected engine.
+    pub async fn finish_weight_update(&self) -> Result<()> {
+        self.collective_rpc(
+            "finish_weight_update",
+            None,
+            Vec::<serde_json::Value>::new(),
+            BTreeMap::<&str, serde_json::Value>::new(),
+        )
+        .await?;
+        Ok(())
     }
 
     /// Return whether the engine is currently sleeping at any level.
