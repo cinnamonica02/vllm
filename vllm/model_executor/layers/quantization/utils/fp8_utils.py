@@ -28,6 +28,7 @@ from vllm.model_executor.parameter import (
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.triton_utils.allocation import set_triton_allocator
 from vllm.utils.deep_gemm import (
     get_tma_aligned_size,
     is_deep_gemm_e8m0_used,
@@ -763,6 +764,7 @@ def _w8a8_triton_block_scaled_mm(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
+    USE_TD: tl.constexpr = False,
 ):
     """Triton-accelerated function used to perform linear operations (dot
     product) on input tensors `A` and `B` with block-wise quantization, and
@@ -779,20 +781,51 @@ def _w8a8_triton_block_scaled_mm(
     pid_m = first_pid_m + (pid % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
 
+    # Scale-vector indexing still needs the wraparound trick (TD isn't used
+    # for these 1-D loads, so out-of-bounds tiles must stay address-safe).
     offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
-    a_ptrs = A + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
-    b_ptrs = B + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
 
     As_ptrs = As + offs_am * stride_As_m
     offs_bsn = offs_bn // group_n
     Bs_ptrs = Bs + offs_bsn * stride_Bs_n
 
+    if USE_TD:
+        # Descriptors are built once per program and reused across the whole
+        # K loop; out-of-bounds tiles are zero-padded by TD itself, so the
+        # wraparound/mask tricks the raw-pointer path needs are unnecessary.
+        # TMA requires each descriptor's innermost dim to be statically
+        # known contiguous (stride 1). A's last dim (K) already is. B is
+        # (N, K) with K contiguous, so its descriptor is built over (N, K)
+        # and the loaded tile is transposed to the (K, N) orientation
+        # tl.dot needs.
+        a_desc = tl.make_tensor_descriptor(
+            base=A,
+            shape=(M, K),
+            strides=(stride_am, 1),
+            block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_K),
+        )
+        b_desc = tl.make_tensor_descriptor(
+            base=B,
+            shape=(N, K),
+            strides=(stride_bn, 1),
+            block_shape=(BLOCK_SIZE_N, BLOCK_SIZE_K),
+        )
+    else:
+        a_ptrs = A + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+        b_ptrs = B + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
-        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+        if USE_TD:
+            a = a_desc.load([pid_m * BLOCK_SIZE_M, k * BLOCK_SIZE_K])
+            b = tl.trans(b_desc.load([pid_n * BLOCK_SIZE_N, k * BLOCK_SIZE_K]))
+        else:
+            a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
+            b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+            a_ptrs += BLOCK_SIZE_K * stride_ak
+            b_ptrs += BLOCK_SIZE_K * stride_bk
 
         k_start = k * BLOCK_SIZE_K
         offs_ks = k_start // group_k
@@ -800,8 +833,6 @@ def _w8a8_triton_block_scaled_mm(
         b_s = tl.load(Bs_ptrs + offs_ks * stride_Bs_k)
 
         accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
-        a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += BLOCK_SIZE_K * stride_bk
 
     if C.dtype.element_ty == tl.bfloat16:
         c = accumulator.to(tl.bfloat16)
@@ -926,6 +957,38 @@ def w8a8_triton_block_scaled_mm(
             triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
         )
 
+    # ``VLLM_TRITON_USE_TD`` is the single shared flag for all TD-converted
+    # Triton kernels (no per-kernel var); unset means platform auto-detect.
+    # An explicit override always wins, forcing TD on/off regardless of
+    # shape - needed so correctness tests can force TD onto small-K
+    # boundary shapes to exercise its own logic, independent of whether
+    # that shape would actually be picked by auto-detect.
+    td_override = envs.VLLM_TRITON_USE_TD
+    if td_override is None:
+        # XPU always benefits (RFC default). On CUDA, H100 benchmarking
+        # across DeepSeek-V3 shapes showed TD is flat-to-regressive for
+        # K < 8192 at every batch size tested, and a consistent 5-16% win
+        # for K >= 8192 - gate CUDA auto-detect on that. Not validated on
+        # XPU, so the K-gate only applies to the CUDA branch.
+        use_td = current_platform.is_xpu() or (
+            current_platform.is_cuda() and K >= 8192
+        )
+    else:
+        use_td = td_override
+    # TMA requires each descriptor's leading-dimension stride to be a
+    # multiple of 16 bytes; A/B's shared leading stride here is K. Violating
+    # this does not raise an error, it silently corrupts output, so fall
+    # back to the raw-pointer path rather than trust an unaligned K.
+    use_td = use_td and (K * A.element_size()) % 16 == 0
+    if use_td:
+        # The TD path hardcodes B's innermost stride as the literal 1 TMA
+        # requires; only valid if B is actually contiguous there.
+        assert B.stride(-1) == 1, "TD path requires B contiguous in its last dim"
+        # Device-side tensor descriptors need a scratch allocator registered
+        # on the Triton runtime before launch (same requirement as the
+        # existing TD kernels in fused_moe_lora_op.py / olmo_gdn_linear_attn.py).
+        set_triton_allocator(A.device)
+
     _w8a8_triton_block_scaled_mm[grid](
         A,
         B,
@@ -947,6 +1010,7 @@ def w8a8_triton_block_scaled_mm(
         As.stride(-1),
         Bs.stride(1),
         Bs.stride(0),
+        USE_TD=use_td,
         **config,
     )
 

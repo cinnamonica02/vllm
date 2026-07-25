@@ -78,7 +78,9 @@ def build_w8a8_block_fp8_runner(M, N, K, block_size, device, use_cutlass):
         activation_quant_key=create_fp8_quant_key(
             static=False, group_shape=act_quant_group_shape
         ),
+        input_dtype=A_ref.dtype,
         out_dtype=torch.get_default_dtype(),
+        weight_shape=(N, K),
         module_name="build_w8a8_block_fp8_runner",
     )
 
