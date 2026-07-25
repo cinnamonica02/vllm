@@ -120,12 +120,7 @@ def test_per_token_group_quant_fp8(
             assert scale.stride()[-1] == get_tma_aligned_size(num_tokens, 4)
 
 
-@pytest.mark.parametrize(
-    "M,N,K,block_size,out_dtype,seed",
-    itertools.product(M, N, K, BLOCK_SIZE, OUT_DTYPES, SEEDS),
-)
-@torch.inference_mode()
-def test_w8a8_block_fp8_matmul(M, N, K, block_size, out_dtype, seed):
+def _w8a8_block_fp8_matmul_rel_diff(M, N, K, block_size, out_dtype, seed):
     torch.manual_seed(seed)
     factor_for_scale = 1e-2
     fp8_info = torch.finfo(current_platform.fp8_dtype())
@@ -147,9 +142,40 @@ def test_w8a8_block_fp8_matmul(M, N, K, block_size, out_dtype, seed):
     ref_out = native_w8a8_block_matmul(A_fp8, B_fp8, As, Bs, block_size, out_dtype)
     out = w8a8_triton_block_scaled_mm(A_fp8, B_fp8, As, Bs, block_size, out_dtype)
 
-    rel_diff = torch.mean(
+    return torch.mean(
         torch.abs(out.to(torch.float32) - ref_out.to(torch.float32))
     ) / torch.mean(torch.abs(ref_out.to(torch.float32)))
+
+
+@pytest.mark.parametrize(
+    "M,N,K,block_size,out_dtype,seed",
+    itertools.product(M, N, K, BLOCK_SIZE, OUT_DTYPES, SEEDS),
+)
+@torch.inference_mode()
+def test_w8a8_block_fp8_matmul(M, N, K, block_size, out_dtype, seed):
+    rel_diff = _w8a8_block_fp8_matmul_rel_diff(M, N, K, block_size, out_dtype, seed)
+    assert rel_diff < 0.001
+
+
+@pytest.mark.parametrize(
+    "M,N,K",
+    [
+        (1, 128, 256),  # M=1: single non-full BLOCK_SIZE_M tile
+        (83, 576, 3888),  # non-power-of-2 boundary tile on all three dims
+        (83, 576, 3884),  # K not 16-byte aligned: exercises safety fallback
+        (4096, 13824, 16384),  # large K: exercises multi-tile descriptor reuse
+    ],
+)
+@torch.inference_mode()
+def test_w8a8_block_fp8_matmul_td(M, N, K, monkeypatch):
+    """Same reference check as test_w8a8_block_fp8_matmul, forced onto the
+    tensor-descriptor path via VLLM_TRITON_USE_TD, to catch TD-specific
+    boundary-tile bugs (zero-pad vs. wrap-and-mask) before benchmarking.
+    """
+    monkeypatch.setenv("VLLM_TRITON_USE_TD", "1")
+    rel_diff = _w8a8_block_fp8_matmul_rel_diff(
+        M, N, K, block_size=[128, 128], out_dtype=torch.bfloat16, seed=0
+    )
     assert rel_diff < 0.001
 
 
