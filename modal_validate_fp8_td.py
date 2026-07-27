@@ -12,11 +12,22 @@ Usage:
 """
 
 import subprocess
+from datetime import datetime
+from pathlib import Path
 
 import modal
 
 REPO_URL = "https://github.com/cinnamonica02/vllm.git"
 BRANCH = "cinnamonica02/w8a8-fp8-block-scaled-td"
+
+LOG_NAMES = [
+    "bench_td_off",
+    "bench_td_on",
+    "e2e_td_off",
+    "e2e_td_on",
+    "server_td_off",
+    "server_td_on",
+]
 
 image = (
     modal.Image.from_registry(
@@ -30,20 +41,38 @@ app = modal.App("vllm-fp8-td-validate", image=image)
 
 
 @app.function(gpu="H100", timeout=3600)
-def run_validation():
+def run_validation() -> tuple[bool, dict[str, str]]:
     subprocess.run(
         ["git", "clone", "--branch", BRANCH, "--single-branch", "--depth", "1",
          REPO_URL, "repo"],
         check=True,
     )
-    subprocess.run(["bash", "validate_fp8_td.sh"], check=True, cwd="repo")
+    # No check=True: a failure must still fall through to log collection
+    # below, not lose everything to an exception before logs are read.
+    result = subprocess.run(["bash", "validate_fp8_td.sh"], cwd="repo")
 
-    print("\n=== bench_td_off.log ===")
-    subprocess.run(["cat", "/tmp/bench_td_off.log"], check=True)
-    print("\n=== bench_td_on.log ===")
-    subprocess.run(["cat", "/tmp/bench_td_on.log"], check=True)
+    logs = {}
+    for name in LOG_NAMES:
+        path = Path(f"/tmp/{name}.log")
+        if path.exists():
+            logs[name] = path.read_text()
+
+    return result.returncode == 0, logs
 
 
 @app.local_entrypoint()
 def main():
-    run_validation.remote()
+    success, logs = run_validation.remote()
+
+    out_dir = Path("run_logs") / datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    for name, content in logs.items():
+        print(f"\n=== {name}.log ===")
+        print(content)
+        (out_dir / f"{name}.log").write_text(content)
+
+    print(f"\nLogs saved to {out_dir}/")
+
+    if not success:
+        raise RuntimeError("validate_fp8_td.sh failed - see logs above")
