@@ -966,12 +966,14 @@ def w8a8_triton_block_scaled_mm(
     td_override = envs.VLLM_TRITON_USE_TD
     if td_override is None:
         # XPU always benefits (RFC default). On CUDA, H100 benchmarking
-        # across DeepSeek-V3 shapes showed TD is flat-to-regressive for
-        # K < 8192 at every batch size tested, and a consistent 5-16% win
-        # for K >= 8192 - gate CUDA auto-detect on that. Not validated on
-        # XPU, so the K-gate only applies to the CUDA branch.
+        # across DeepSeek-V3 shapes showed TD is a consistent 5-13% win
+        # for K >= 8192, but only once M >= 64 - below that there isn't
+        # enough work per launch to amortize TMA descriptor setup, and
+        # K >= 8192 alone still regressed 11-17% at M=1/M=16. Gate CUDA
+        # auto-detect on both. Not validated on XPU, so this only applies
+        # to the CUDA branch.
         use_td = current_platform.is_xpu() or (
-            current_platform.is_cuda() and K >= 8192
+            current_platform.is_cuda() and K >= 8192 and M >= 64
         )
     else:
         use_td = td_override

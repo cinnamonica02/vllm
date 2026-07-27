@@ -41,29 +41,55 @@ echo ""
 echo "=== Benchmark: TD auto-detect (K-gated on CUDA, no override set) ==="
 python -m benchmarks.kernels.benchmark_block_fp8_td 2>&1 | tee /tmp/bench_td_on.log
 
-echo ""
-echo "=== E2E: preparing trimmed DeepSeek-V3 dummy model (config+tokenizer only) ==="
-python benchmarks/kernels/prepare_e2e_fp8_td_model.py /tmp/deepseek_v3_mini
+E2E_MODEL="gaunernst/DeepSeek-V2-Lite-Chat-FP8"
+
+wait_for_server() {
+    for i in $(seq 1 400); do
+        if curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8000/health 2>/dev/null | grep -q 200; then
+            echo "Server ready after ${i}s"
+            return 0
+        fi
+        sleep 1
+    done
+    echo "FAIL: server did not become ready within 400s"
+    return 1
+}
 
 echo ""
-echo "=== E2E latency: TD OFF (baseline) ==="
-VLLM_TRITON_USE_TD=0 vllm bench latency \
-    --model /tmp/deepseek_v3_mini \
-    --load-format dummy \
-    --linear-backend triton \
-    --input-len 128 --output-len 128 --batch-size 8 \
+echo "=== E2E serve: TD OFF (baseline) ==="
+VLLM_TRITON_USE_TD=0 vllm serve "$E2E_MODEL" \
+    --linear-backend triton --port 8000 \
+    > /tmp/server_td_off.log 2>&1 &
+server_pid=$!
+wait_for_server
+vllm bench serve \
+    --model "$E2E_MODEL" \
+    --host 127.0.0.1 --port 8000 \
+    --dataset-name random --random-input-len 128 --random-output-len 128 \
+    --num-prompts 300 --request-rate inf \
     2>&1 | tee /tmp/e2e_td_off.log
+kill "$server_pid" 2>/dev/null || true
+wait "$server_pid" 2>/dev/null || true
+sleep 2
 
 echo ""
-echo "=== E2E latency: TD auto-detect (K-gated on CUDA, no override set) ==="
-vllm bench latency \
-    --model /tmp/deepseek_v3_mini \
-    --load-format dummy \
-    --linear-backend triton \
-    --input-len 128 --output-len 128 --batch-size 8 \
+echo "=== E2E serve: TD auto-detect (K-gated on CUDA, no override set) ==="
+vllm serve "$E2E_MODEL" \
+    --linear-backend triton --port 8000 \
+    > /tmp/server_td_on.log 2>&1 &
+server_pid=$!
+wait_for_server
+vllm bench serve \
+    --model "$E2E_MODEL" \
+    --host 127.0.0.1 --port 8000 \
+    --dataset-name random --random-input-len 128 --random-output-len 128 \
+    --num-prompts 300 --request-rate inf \
     2>&1 | tee /tmp/e2e_td_on.log
+kill "$server_pid" 2>/dev/null || true
+wait "$server_pid" 2>/dev/null || true
 
 echo ""
 echo "=== Done ==="
 echo "Logs: /tmp/bench_td_off.log  /tmp/bench_td_on.log  /tmp/e2e_td_off.log  /tmp/e2e_td_on.log"
+echo "Server logs: /tmp/server_td_off.log  /tmp/server_td_on.log"
 echo "Copy all out (e.g. via modal volume, or paste back) before exiting the shell."
