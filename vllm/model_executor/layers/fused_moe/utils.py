@@ -628,6 +628,22 @@ def resolve_moe_use_td() -> bool:
     return override
 
 
+def resolve_moe_use_td_b(M: int) -> bool:
+    """Tri-state resolver for ``VLLM_TRITON_USE_TD_B`` (weights-only TD for
+    ``fused_moe_kernel``'s quantized block-scaled branch).
+
+    Unset auto-gates on ``M >= 1024``: the interleaved scale load/multiply
+    inside the K-loop regresses TD below this on measured H100 shapes
+    (3-10% slower), with a small ~1-2% win above it (see
+    ``benchmarks/kernels/benchmark_fused_moe_td_b.py``). ``1``/``0`` force it
+    on/off regardless of ``M``, for A/B benchmarking.
+    """
+    override = envs.VLLM_TRITON_USE_TD_B
+    if override is None:
+        return M >= 1024
+    return override
+
+
 _warned_moe_use_td_ineffective = False
 
 

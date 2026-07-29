@@ -7,7 +7,7 @@ import itertools
 import pytest
 import torch
 
-from tests.kernels.moe.utils import fused_moe
+from tests.kernels.moe.utils import fused_moe, make_test_quant_config
 from vllm import _custom_ops as ops
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.activation import SiluAndMul
@@ -168,3 +168,44 @@ def test_w8a8_fp8_fused_moe(M, N, K, E, topk, dtype, seed):
         torch.abs(out.to(torch.float32) - ref_out.to(torch.float32))
     ) / torch.mean(torch.abs(ref_out.to(torch.float32)))
     assert rel_diff < 0.05
+
+
+@pytest.mark.parametrize("M,N,K", [(1, 1024, 256), (64, 1024, 8192), (256, 1024, 8192)])
+@pytest.mark.parametrize("E,topk", [(8, 2)])
+@torch.inference_mode()
+def test_fused_moe_block_fp8_td_b_matches_plain(M, N, K, E, topk, monkeypatch):
+    """Weights-only TD path (B via tensor descriptor on Hopper+, block-fp8
+    quantized) must match the plain pointer-arithmetic path bit-for-bit
+    modulo fp8 rounding. USE_TD_B has no A-gather (unlike the Blackwell/XPU
+    USE_TD path), so it's only gated on hardware capability + quantization,
+    not model shape - forcing has_device_capability(90) True/False on the
+    same real GPU run isolates the two code paths for comparison."""
+    torch.manual_seed(0)
+    block_shape = [128, 128]
+    a = torch.randn((M, K), dtype=torch.bfloat16) / 10
+    w1, w2, quant_config = make_test_quant_config(
+        E,
+        N,
+        K,
+        torch.bfloat16,
+        torch.float8_e4m3fn,
+        block_shape=block_shape,
+    )
+    score = torch.randn((M, E), dtype=torch.bfloat16)
+
+    with set_current_vllm_config(vllm_config):
+        monkeypatch.setattr(
+            current_platform, "has_device_capability", lambda *a, **k: False
+        )
+        out_plain = fused_moe(
+            a, w1, w2, score, topk, renormalize=False, quant_config=quant_config
+        )
+
+        monkeypatch.setattr(
+            current_platform, "has_device_capability", lambda *a, **k: True
+        )
+        out_td_b = fused_moe(
+            a, w1, w2, score, topk, renormalize=False, quant_config=quant_config
+        )
+
+    torch.testing.assert_close(out_td_b, out_plain, rtol=2e-2, atol=2e-2)

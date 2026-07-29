@@ -87,6 +87,7 @@ if TYPE_CHECKING:
     VLLM_FLOAT32_MATMUL_PRECISION: Literal["highest", "high", "medium"] = "highest"
     VLLM_BATCH_INVARIANT: bool = False
     VLLM_TRITON_USE_TD: bool | None = None
+    VLLM_TRITON_USE_TD_B: bool | None = None
     # Deprecated alias of VLLM_TRITON_USE_TD (removed in v0.25).
     VLLM_TRITON_ATTN_USE_TD: bool | None = None
     VLLM_GPU_SYNC_CHECK: Literal["warn", "error"] | None = None
@@ -615,6 +616,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ``0`` forces TD off.  Useful for A/B benchmarking the TD path.
     "VLLM_TRITON_USE_TD": lambda: {"1": True, "0": False}.get(
         os.getenv("VLLM_TRITON_USE_TD", "").strip()
+    ),
+    # Weights-only tensor-descriptor path for fused_moe_kernel's quantized
+    # block-scaled branch (B via tl.make_tensor_descriptor; A stays on raw
+    # pointers, since it's gather-fed and the gather instruction needs
+    # Blackwell). Tri-state override: unset (default) auto-gates on M >= 1024
+    # (measured crossover on H100 -- interleaved scale load/multiply fights
+    # TD below this, small win above); ``1``/``0`` force it on/off regardless
+    # of M. Useful for A/B benchmarking.
+    "VLLM_TRITON_USE_TD_B": lambda: {"1": True, "0": False}.get(
+        os.getenv("VLLM_TRITON_USE_TD_B", "").strip()
     ),
     # If set, enable PyTorch's GPU<->CPU synchronization debug mode around
     # the worker's `execute_model` and `sample_tokens` calls. Valid values

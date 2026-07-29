@@ -29,6 +29,7 @@ from vllm.model_executor.layers.fused_moe.utils import (
     enable_swap_ab,
     moe_kernel_quantize_input,
     resolve_moe_use_td,
+    resolve_moe_use_td_b,
     warn_if_moe_use_td_ineffective,
 )
 from vllm.platforms import current_platform
@@ -352,6 +353,11 @@ def fused_moe_kernel(
     SWAP_AB: tl.constexpr,
     # Tensor-descriptor path for the A gather and B load in the K-loop.
     USE_TD: tl.constexpr = False,
+    # Weights-only TD: B via tensor descriptor, A stays on raw pointers.
+    # For when the A gather isn't available (Hopper has no tile::gather4)
+    # but B's per-expert (N, K) slab is still a clean, non-gathered TMA
+    # target. Mutually exclusive with USE_TD.
+    USE_TD_B: tl.constexpr = False,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -443,6 +449,7 @@ def fused_moe_kernel(
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     # TD gather and the SWAP_AB accumulator layout are mutually exclusive.
     tl.static_assert(not (USE_TD and SWAP_AB))
+    tl.static_assert(not (USE_TD and USE_TD_B))
     if USE_TD:
         # ``tt.descriptor_gather`` requires block_shape[0] == 1 and i32 idx.
         m_td = num_valid_tokens // top_k
@@ -459,24 +466,36 @@ def fused_moe_kernel(
             block_shape=(BLOCK_SIZE_N, BLOCK_SIZE_K),
         )
         gather_idx = (offs_token // top_k).to(tl.int32)
-    elif SWAP_AB:
-        a_ptrs = a_ptr + (
-            offs_k[:, None] * stride_ak + offs_token[None, :] // top_k * stride_am
-        )
-        b_ptrs = (
-            b_ptr
-            + off_experts * stride_be
-            + (offs_bn[:, None] * stride_bn + offs_k[None, :] * stride_bk)
-        )
     else:
-        a_ptrs = a_ptr + (
-            offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
-        )
-        b_ptrs = (
-            b_ptr
-            + off_experts * stride_be
-            + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
-        )
+        if SWAP_AB:
+            a_ptrs = a_ptr + (
+                offs_k[:, None] * stride_ak + offs_token[None, :] // top_k * stride_am
+            )
+        else:
+            a_ptrs = a_ptr + (
+                offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
+            )
+        if USE_TD_B:
+            # A stays on raw pointers (gather-fed, not a fixed-stride block).
+            # B is a clean per-expert (N, K) slab - a real TMA target.
+            b_desc = tl.make_tensor_descriptor(
+                base=b_ptr + off_experts * stride_be,
+                shape=(N, K),
+                strides=(stride_bn, stride_bk),
+                block_shape=(BLOCK_SIZE_N, BLOCK_SIZE_K),
+            )
+        elif SWAP_AB:
+            b_ptrs = (
+                b_ptr
+                + off_experts * stride_be
+                + (offs_bn[:, None] * stride_bn + offs_k[None, :] * stride_bk)
+            )
+        else:
+            b_ptrs = (
+                b_ptr
+                + off_experts * stride_be
+                + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+            )
     if use_int8_w8a16:
         b_scale_ptrs = (
             b_scale_ptr + off_experts * stride_bse + offs_bn[None, :] * stride_bsn
@@ -523,18 +542,26 @@ def fused_moe_kernel(
         if USE_TD:
             a = a_desc.gather(gather_idx, k * BLOCK_SIZE_K)
             b = b_desc.load([pid_n * BLOCK_SIZE_N, k * BLOCK_SIZE_K]).T
-        elif SWAP_AB:
-            a_mask = (offs_k[:, None] < K - k * BLOCK_SIZE_K) & token_mask[None, :]
-            b_mask = offs_k[None, :] < K - k * BLOCK_SIZE_K
-            a = tl.load(a_ptrs, mask=a_mask, other=0.0)
-            b = tl.load(b_ptrs, mask=b_mask, other=0.0)
         else:
-            a = tl.load(
-                a_ptrs,
-                mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
-                other=0.0,
-            )
-            b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+            if SWAP_AB:
+                a_mask = (offs_k[:, None] < K - k * BLOCK_SIZE_K) & token_mask[None, :]
+                a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+            else:
+                a = tl.load(
+                    a_ptrs,
+                    mask=token_mask[:, None]
+                    & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
+                    other=0.0,
+                )
+            if USE_TD_B:
+                b_block = b_desc.load([pid_n * BLOCK_SIZE_N, k * BLOCK_SIZE_K])
+                b = b_block if SWAP_AB else tl.trans(b_block)
+            else:
+                if SWAP_AB:
+                    b_mask = offs_k[None, :] < K - k * BLOCK_SIZE_K
+                else:
+                    b_mask = offs_k[:, None] < K - k * BLOCK_SIZE_K
+                b = tl.load(b_ptrs, mask=b_mask, other=0.0)
         # We accumulate along the K dimension.
         if use_int8_w8a16:
             accumulator = tl.dot(a, b.to(compute_type), acc=accumulator)
@@ -562,9 +589,11 @@ def fused_moe_kernel(
         else:
             accumulator += tl.dot(a, b)
         if not USE_TD:
-            # Advance the ptrs to the next K block.
+            # Advance the ptrs to the next K block. b_desc.load() (USE_TD_B)
+            # takes absolute offsets, so b_ptrs isn't used/advanced there.
             a_ptrs += BLOCK_SIZE_K * stride_ak
-            b_ptrs += BLOCK_SIZE_K * stride_bk
+            if not USE_TD_B:
+                b_ptrs += BLOCK_SIZE_K * stride_bk
 
     if SWAP_AB:
         accumulator = tl.trans(accumulator, (1, 0))
@@ -804,6 +833,31 @@ def invoke_fused_moe_triton_kernel(
         # (Triton raises "no allocator was set" otherwise on CUDA).
         set_triton_allocator(A.device)
 
+    # Weights-only TD prototype: B via TMA on Hopper+, even when quantized.
+    # The A gather (USE_TD above) needs Blackwell's tile::gather4, which
+    # doesn't compile on Hopper - but B's per-expert (N, K) slab never
+    # gathers, so tl.make_tensor_descriptor works on it regardless of
+    # platform tier or quantization. Scoped to the block-quantized branch
+    # (structurally identical to the K-loop in _w8a8_triton_block_scaled_mm).
+    # Benchmarked on DeepSeek-V2-Lite-Chat-FP8 shapes (H100): M<1024 regresses
+    # 3-10% (interleaved scale load/multiply fights TD at small tiles, same
+    # effect Kernel A's M-gate addressed), M>=1024 wins ~1-2%. Gate on M via
+    # resolve_moe_use_td_b (VLLM_TRITON_USE_TD_B override) to keep the win
+    # without the regression, while still allowing A/B override.
+    use_td_b = (
+        not use_td
+        and is_quantized
+        and (use_fp8_w8a8 or use_int8_w8a8)
+        and block_shape is not None
+        and current_platform.is_cuda()
+        and current_platform.has_device_capability(90)
+        and resolve_moe_use_td_b(A.size(0))
+        and B.stride(-1) == 1
+        and (B.size(-1) * B.element_size()) % 16 == 0
+    )
+    if use_td_b:
+        set_triton_allocator(A.device)
+
     if use_fp8_w8a8 or use_int8_w8a8:
         assert B_scale is not None
         assert block_shape is None or triton.cdiv(
@@ -844,7 +898,7 @@ def invoke_fused_moe_triton_kernel(
     BLOCK_SIZE_K = config.pop("BLOCK_SIZE_K")
     if block_shape is not None:
         BLOCK_SIZE_K = min(BLOCK_SIZE_K, min(block_shape[0], block_shape[1]))
-    if use_td and A.size(1) % BLOCK_SIZE_K != 0:
+    if (use_td or use_td_b) and A.size(1) % BLOCK_SIZE_K != 0:
         # TD gather/load feeding tl.dot with a non-block-aligned K
         # miscompiles (~74% of output elements wrong) on real HW;
         # this is a compiler-codegen issue, not a Python-maskable
@@ -857,6 +911,7 @@ def invoke_fused_moe_triton_kernel(
             BLOCK_SIZE_K,
         )
         use_td = False
+        use_td_b = False
     fused_moe_kernel[grid](
         A,
         B,
@@ -900,6 +955,7 @@ def invoke_fused_moe_triton_kernel(
         BLOCK_SIZE_K=BLOCK_SIZE_K,
         SWAP_AB=SWAP_AB,
         USE_TD=use_td,
+        USE_TD_B=use_td_b,
         **config,
     )
 
