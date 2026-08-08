@@ -54,16 +54,22 @@ COMMON=(--model "$MODEL" --dtype bfloat16
 
 run_workload() {
     local name=$1 in_len=$2 out_len=$3
+    # --random-input-len/--random-output-len, NOT --input-len/--output-len:
+    # the latter default to None and get silently outranked by
+    # --random-input-len/--random-output-len's own non-None defaults
+    # (1024/128) in throughput.py's "prefer random_* over regular" fallback,
+    # so --input-len/--output-len are dead whenever --dataset-name random is
+    # in play. Caught via oonyshch's own bench command note on RFC #42545.
     echo ""
     echo "=== Throughput: $name (in=$in_len out=$out_len) - TD OFF (raw ptr, default on CUDA) ==="
     VLLM_TRITON_USE_TD=0 vllm bench throughput "${COMMON[@]}" \
-        --dataset-name random --input-len "$in_len" --output-len "$out_len" \
+        --dataset-name random --random-input-len "$in_len" --random-output-len "$out_len" \
         --num-prompts 200 2>&1 | tee "/tmp/bench_${name}_td_off.log"
 
     echo ""
     echo "=== Throughput: $name (in=$in_len out=$out_len) - TD ON (hoisted, default num_stages) ==="
     VLLM_TRITON_USE_TD=1 vllm bench throughput "${COMMON[@]}" \
-        --dataset-name random --input-len "$in_len" --output-len "$out_len" \
+        --dataset-name random --random-input-len "$in_len" --random-output-len "$out_len" \
         --num-prompts 200 2>&1 | tee "/tmp/bench_${name}_td_on.log"
 }
 
