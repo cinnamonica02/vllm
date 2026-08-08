@@ -33,6 +33,7 @@ from vllm.v1.kv_cache_interface import KVQuantMode
 
 logger = init_logger(__name__)
 is_batch_invariant = envs.VLLM_BATCH_INVARIANT
+_TD_ALLOCATOR_DEVICES: set[torch.device] = set()
 float8_info = torch.finfo(current_platform.fp8_dtype())
 
 
@@ -1060,14 +1061,14 @@ def unified_attention(
     if launch_num_stages is not None:
         launch_kwargs["num_stages"] = launch_num_stages
 
-    if use_td:
+    if (use_td or use_td_qo) and q.device not in _TD_ALLOCATOR_DEVICES:
         # The hoisted 3D descriptor requires a PyTorch-backed scratch
-        # allocator to be registered (Triton raises "Kernel requires a
-        # runtime memory allocation, but no allocator was set" otherwise
-        # on sm_100/sm_120 - Hopper's num_stages=1 fallback masked this
-        # same requirement instead of erroring). Same pattern as the
-        # fused_moe / GDN / LoRA TD paths.
+        # allocator to be registered (Triton raises "no allocator was
+        # set" otherwise on sm_100/sm_120). Same pattern as fused_moe /
+        # GDN / LoRA's TD paths; cached per device like the newer
+        # triton_scaled_mm TD path, since this call site is per-forward-pass.
         set_triton_allocator(q.device)
+        _TD_ALLOCATOR_DEVICES.add(q.device)
 
     kernel_unified_attention[grid](
         output_ptr=out,
