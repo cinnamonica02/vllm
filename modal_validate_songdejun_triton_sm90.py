@@ -80,7 +80,17 @@ image = (
         "nvidia/cuda:13.0.3-devel-ubuntu22.04", add_python="3.12"
     )
     .apt_install(
-        "git", "curl", "ca-certificates", "build-essential", "cmake", "ninja-build"
+        "git", "curl", "ca-certificates", "build-essential", "cmake", "ninja-build",
+        # The prebuilt LLVM package Triton downloads was built with zlib
+        # support, so its CMake export files reference ZLIB::ZLIB. Without
+        # zlib's dev headers, find_package(ZLIB) fails silently (a warning,
+        # not an error) and CMake only hits a hard error later when it
+        # tries to resolve that reference on LLVMSupport/lldELF. libxml2-dev
+        # added proactively for the same reason (same "Could NOT find"
+        # pattern seen for it, even though it didn't trigger the fatal
+        # error this specific run - avoids re-discovering this one file at
+        # a time on a >5-minute-per-attempt build).
+        "zlib1g-dev", "libxml2-dev",
     )
     .pip_install("uv")
 )
