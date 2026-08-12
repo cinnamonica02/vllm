@@ -31,9 +31,12 @@ from vllm.v1.attention.ops.triton_attention_helpers import (
 )
 from vllm.v1.kv_cache_interface import KVQuantMode
 
+# Devices already registered with set_triton_allocator(); avoids a redundant
+# call on every unified_attention() forward pass when USE_TD is on.
+_TD_ALLOCATOR_DEVICES: set[torch.device] = set()
+
 logger = init_logger(__name__)
 is_batch_invariant = envs.VLLM_BATCH_INVARIANT
-_TD_ALLOCATOR_DEVICES: set[torch.device] = set()
 float8_info = torch.finfo(current_platform.fp8_dtype())
 
 
