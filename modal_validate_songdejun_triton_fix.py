@@ -74,13 +74,25 @@ def run_validation() -> tuple[bool, dict[str, str]]:
 
     step("Creating venv", t0)
     subprocess.run(["uv", "venv", "--python", "3.12"], cwd="repo", check=True)
-    venv_python = "repo/.venv/bin/python"
+    # Absolute paths everywhere below, used both as VIRTUAL_ENV and directly
+    # as the python/pytest binary - "triton" is a sibling of "repo", not a
+    # subdirectory, so uv's cwd-relative venv auto-discovery would silently
+    # miss repo/.venv when invoked from cwd="triton" (installing Triton
+    # somewhere else, leaving the pytest run below importing whatever Triton
+    # vLLM pulled in as a normal pinned dependency instead of our build).
+    # Same reasoning applies to any subprocess call below that also sets a
+    # cwd - a relative venv path would resolve against *that* cwd, not this
+    # one, so relative paths are avoided entirely rather than reasoned about
+    # per call site.
+    venv_abs = str((Path.cwd() / "repo" / ".venv").resolve())
+    venv_python = str(Path(venv_abs) / "bin" / "python")
+    uv_env = {**os.environ, "VIRTUAL_ENV": venv_abs}
 
     step("Installing vLLM (precompiled)", t0)
     subprocess.run(
         ["uv", "pip", "install", "-e", ".", "--torch-backend=auto"],
         cwd="repo",
-        env={**os.environ, "VLLM_USE_PRECOMPILED": "1"},
+        env={**uv_env, "VLLM_USE_PRECOMPILED": "1"},
         check=True,
     )
 
@@ -88,6 +100,7 @@ def run_validation() -> tuple[bool, dict[str, str]]:
     subprocess.run(
         ["uv", "pip", "install", "-r", "requirements/test/cuda.in"],
         cwd="repo",
+        env=uv_env,
         check=True,
     )
 
@@ -117,6 +130,19 @@ def run_validation() -> tuple[bool, dict[str, str]]:
     subprocess.run(
         ["uv", "pip", "install", "-e", ".", "-v"],
         cwd="triton",
+        env=uv_env,
+        check=True,
+    )
+
+    step("Verifying which Triton actually got installed", t0)
+    subprocess.run(
+        [venv_python, "-c",
+         "import triton, subprocess, os; "
+         "print('triton module path:', triton.__file__); "
+         "print('triton version:', triton.__version__); "
+         "print('HEAD in that checkout:', subprocess.run("
+         "['git', 'rev-parse', 'HEAD'], cwd='triton', "
+         "capture_output=True, text=True).stdout.strip())"],
         check=True,
     )
 
