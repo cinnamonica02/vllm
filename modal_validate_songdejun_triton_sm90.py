@@ -126,8 +126,16 @@ def _run_validation(tag: str) -> tuple[bool, dict[str, str]]:
     )
 
     step("Cloning vLLM PR head", t0, tag)
+    # No --depth here (unlike the other validate scripts' shallow clones):
+    # vLLM's own precompiled-wheel install logic runs `git merge-base`
+    # against the upstream nightly commit to find a compatible wheel. A
+    # shallow clone has no ancestry graph for that to walk, so it silently
+    # falls back to "just grab the nightly wheel regardless of platform" -
+    # which is what broke last run (it grabbed an aarch64-only build on our
+    # x86_64 container). Full history costs a bit more clone time, cheap
+    # relative to the ~30-60min Triton build either way.
     subprocess.run(
-        ["git", "clone", "--branch", BRANCH, "--single-branch", "--depth", "1",
+        ["git", "clone", "--branch", BRANCH, "--single-branch",
          REPO_URL, "repo"],
         check=True,
     )
@@ -143,12 +151,28 @@ def _run_validation(tag: str) -> tuple[bool, dict[str, str]]:
     uv_env = {**os.environ, "VIRTUAL_ENV": venv_abs}
 
     step("Installing vLLM (precompiled)", t0, tag)
-    subprocess.run(
+    # Back to VLLM_USE_PRECOMPILED=1: the aarch64-only wheel gap hit
+    # earlier was tied to whatever "latest main" commit existed at that
+    # exact moment - a likely-transient publishing-lag issue, not a
+    # permanent state. Trying this first since it's cheap to check and,
+    # if it works, sidesteps the torch-version-skew source-build problem
+    # entirely (precompiled wheels ship with a tested, compatible torch
+    # already baked in). Falls back to building from source further down
+    # only if this still fails.
+    precompiled_result = subprocess.run(
         ["uv", "pip", "install", "-e", ".", "--torch-backend=auto"],
         cwd="repo",
         env={**uv_env, "VLLM_USE_PRECOMPILED": "1"},
-        check=True,
     )
+    if precompiled_result.returncode != 0:
+        step("Precompiled wheel unavailable again - falling back to "
+             "building vLLM from source", t0, tag)
+        subprocess.run(
+            ["uv", "pip", "install", "-e", ".", "--torch-backend=auto"],
+            cwd="repo",
+            env=uv_env,
+            check=True,
+        )
 
     step("Installing test requirements", t0, tag)
     subprocess.run(
@@ -271,12 +295,12 @@ def _run_validation(tag: str) -> tuple[bool, dict[str, str]]:
     return True, logs
 
 
-@app.function(gpu="H200", timeout=7200)
+@app.function(gpu="H200", timeout=14400)
 def run_h200() -> tuple[bool, dict[str, str]]:
     return _run_validation("h200")
 
 
-@app.function(gpu="B200", timeout=7200)
+@app.function(gpu="B200", timeout=14400)
 def run_b200() -> tuple[bool, dict[str, str]]:
     return _run_validation("b200")
 
