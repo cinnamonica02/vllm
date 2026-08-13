@@ -177,11 +177,19 @@ def _run_validation(tag: str) -> tuple[bool, dict[str, str]]:
     # ever shadow-import it instead of the patched, installed package.
     subprocess.run(["rm", "-rf", "repo/vllm"], check=True)
 
-    step("Installing minimal test deps (pytest only - avoid disturbing "
-         "the base image's already-working torch/vllm-flash-attn combo "
-         "by reinstalling the full test requirements file)", t0, tag)
+    step("Installing test requirements", t0, tag)
+    # Full requirements/test/cuda.in, not just pytest/pytest-asyncio: a
+    # prior run showed tests/conftest.py itself needs more (tblib, at
+    # minimum, and there's no reason to assume it's the only one -
+    # whack-a-mole against unknown conftest deps one at a time isn't
+    # worth it). The earlier worry about disturbing the base image's
+    # working torch/vllm-flash-attn combo doesn't apply the way it did
+    # for the from-source build - we're never invoking vLLM's C++ build
+    # here at all now, so there's no C++ recompile for a shifted torch
+    # version to break. uv won't touch an already-satisfied torch pin
+    # unless this file requires a different version.
     subprocess.run(
-        ["uv", "pip", "install", "--system", "pytest", "pytest-asyncio"],
+        ["uv", "pip", "install", "--system", "-r", "repo/requirements/test/cuda.in"],
         check=True,
     )
 
@@ -239,11 +247,18 @@ def _run_validation(tag: str) -> tuple[bool, dict[str, str]]:
     )
 
     step("Correctness sanity check", t0, tag)
+    # bash -c with `set -o pipefail`, not shell=True: a prior run showed
+    # this pipe silently swallowing a real pytest failure. shell=True
+    # invokes /bin/sh, which on Ubuntu is dash - dash has no pipefail, so
+    # without explicit bash, `cmd | tee file` reports tee's exit code
+    # (near-always 0) instead of cmd's. That let a conftest.py
+    # ModuleNotFoundError sail through undetected while the script kept
+    # going straight into the benchmarks.
     subprocess.run(
-        f"python3 -m pytest "
-        f"tests/kernels/attention/test_triton_unified_attention.py "
-        f"-k use_td -x -v 2>&1 | tee /tmp/{tag}_correctness_use_td.log",
-        shell=True,
+        ["bash", "-c",
+         "set -o pipefail && python3 -m pytest "
+         "tests/kernels/attention/test_triton_unified_attention.py "
+         f"-k use_td -x -v 2>&1 | tee /tmp/{tag}_correctness_use_td.log"],
         cwd="repo",
         check=True,
     )
@@ -260,17 +275,19 @@ def _run_validation(tag: str) -> tuple[bool, dict[str, str]]:
         step(f"Throughput rep {rep}/3: balanced, TD off (raw pointer)",
              t0, tag)
         log_path = f"/tmp/{tag}_bench_balanced_td_off_rep{rep}.log"
-        subprocess.run(
-            f"vllm bench throughput "
-            # shlex.quote, not a plain join: shell=True means /bin/sh
-            # re-parses this whole string, and would strip the double
-            # quotes out of --attention-config's JSON value as its own
-            # quoting syntax before vllm ever sees it (confirmed - that's
-            # exactly what broke last run, '{"backend":"TRITON_ATTN"}'
-            # arrived as the mangled {backend:TRITON_ATTN}).
+        # shlex.quote (shell=True's /bin/sh would otherwise strip the
+        # double quotes out of --attention-config's JSON before vllm ever
+        # sees it) and bash -c with pipefail (same exit-code-swallowing
+        # risk as the correctness check above - extract_throughput()
+        # below happens to catch a failure here too via the missing
+        # "Throughput:" line, but not relying on that as the real check).
+        bench_cmd = (
+            "vllm bench throughput "
             + " ".join(shlex.quote(a) for a in COMMON_BENCH_ARGS)
-            + f" 2>&1 | tee {log_path}",
-            shell=True,
+            + f" 2>&1 | tee {log_path}"
+        )
+        subprocess.run(
+            ["bash", "-c", f"set -o pipefail && {bench_cmd}"],
             env={**os.environ, "VLLM_TRITON_USE_TD": "0"},
             check=True,
         )
@@ -279,17 +296,13 @@ def _run_validation(tag: str) -> tuple[bool, dict[str, str]]:
         step(f"Throughput rep {rep}/3: balanced, TD on (hoisted, "
              f"songdejun's Triton)", t0, tag)
         log_path = f"/tmp/{tag}_bench_balanced_td_on_rep{rep}.log"
-        subprocess.run(
-            f"vllm bench throughput "
-            # shlex.quote, not a plain join: shell=True means /bin/sh
-            # re-parses this whole string, and would strip the double
-            # quotes out of --attention-config's JSON value as its own
-            # quoting syntax before vllm ever sees it (confirmed - that's
-            # exactly what broke last run, '{"backend":"TRITON_ATTN"}'
-            # arrived as the mangled {backend:TRITON_ATTN}).
+        bench_cmd = (
+            "vllm bench throughput "
             + " ".join(shlex.quote(a) for a in COMMON_BENCH_ARGS)
-            + f" 2>&1 | tee {log_path}",
-            shell=True,
+            + f" 2>&1 | tee {log_path}"
+        )
+        subprocess.run(
+            ["bash", "-c", f"set -o pipefail && {bench_cmd}"],
             env={**os.environ, "VLLM_TRITON_USE_TD": "1"},
             check=True,
         )
