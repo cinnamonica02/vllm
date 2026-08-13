@@ -8,37 +8,45 @@ Blackwell datacenter), run in parallel.
 Coverage picture before this script:
   - sm_120 (RTX PRO 6000 Blackwell): BabyDrangoner already tested #10281
     thoroughly there (see PR comments) - not repeated here.
-  - sm_90 (H100/H200): only tested against stock Triton 3.7.1 so far, not
-    against #10281 itself.
-  - sm_100 (B200): only tested against stock Triton (the PR's own existing
-    numbers) - never against a newer Triton or #10281 at all.
+  - sm_90 / sm_100: only tested against stock Triton so far, not #10281.
 
-This fills both remaining gaps in one run, in parallel (two separate Modal
-containers, each on its own GPU type - no reason to pay for two ~30-60min
-Triton-from-source builds sequentially when they don't depend on each
-other).
+REFACTORED to start from vllm/vllm-openai's prebuilt image instead of
+building vLLM from source. Building vLLM from source repeatedly hit an
+unrelated wall: vLLM's requirements/cuda.txt pins torch==2.13.0, but the
+vendored vllm-flash-attn submodule (pinned to a fixed commit in
+cmake/external_projects/vllm_flash_attn.cmake) has a stale hardcoded
+"PyTorch 2.4.0 expected" check, and its C++ extensions fail to compile
+against 2.13.0. That's a real inconsistency in vLLM's current from-source
+build, not something in our control, and not related to Triton/#10281 at
+all - confirmed deterministic (baked into a fixed GIT_TAG, not a moving
+target), so retrying wasn't going to help.
 
-Deliberately does NOT attempt the "loop-local TD + allocator-only control"
-comparison BabyDrangoner ran on sm_120 - that requires hand-reconstructing
-a variant that reverts the hoist but keeps the allocator registration (not
-a clean revert of each other, the allocator call was added in the same
-commit as the hoist), and BabyDrangoner already settled that qualitative
-question (loop-local stays slower than hoisted); very unlikely to flip on
-sm_90 or sm_100 specifically enough to justify the extra build risk.
+BabyDrangoner's own numbers (torch 2.11.0, despite his base commit already
+including the 2.13.0 bump) only make sense if he used a prebuilt image
+too, rather than rebuilding vLLM's C++ extensions locally - matching the
+`docker run ... vllm/vllm-openai:latest` pattern the original Triton
+issue itself used to repro.
 
-Uses the current PR head (cinnamonica02/unified-attn-td-hoist-descriptor)
-throughout on both GPUs - the code path being tested is exactly what's up
-for review, not the pre-hoist commit.
+So: base image ships vLLM already compiled and working against a tested
+torch. We never touch vLLM's build system at all. Only two things get
+swapped on top of that known-good base:
+  1. The one Python file this PR actually changes
+     (vllm/v1/attention/ops/triton_unified_attention.py) - a plain file
+     copy over the installed package, no recompile needed since it's
+     pure Python.
+  2. Triton itself, built from source (songdejun's branch merged onto
+     current triton-lang/triton main - no wheel exists for that specific
+     combination anywhere, source build is the only option there).
 
-songdejun's branch is ~516 commits behind triton-lang/triton main, so
-this merges it onto current main before building, same as the earlier
-(failed) B200 attempt. That run failed on a missing git identity (the
-merge creates a real commit, which git refuses without one); fixed here.
-
-Each GPU's run: correctness sanity check, then throughput for raw-pointer
-(TD off) and hoisted TD (TD on), balanced workload (1024/256), matching
-the model/config already used elsewhere in this PR's testing for direct
-comparability against the existing numbers.
+One risk this specifically guards against: after cloning the repo to get
+that one file (and the test suite), the local checkout's own vllm/
+directory must not be importable when running tests/benchmarks - if it
+were, Python could shadow-import the uncompiled, unpatched local source
+tree instead of the properly-installed (and now-patched) package in
+site-packages, silently defeating the entire point. Fixed by locating the
+real installed vllm path *before* ever cd-ing into the clone, then
+deleting the clone's local vllm/ directory entirely right after copying
+out the one file we need from it.
 
 Usage:
     modal run modal_validate_songdejun_triton_sm90.py
@@ -56,6 +64,7 @@ import modal
 
 REPO_URL = "https://github.com/cinnamonica02/vllm.git"
 BRANCH = "cinnamonica02/unified-attn-td-hoist-descriptor"
+KERNEL_REL_PATH = "vllm/v1/attention/ops/triton_unified_attention.py"
 
 TRITON_REPO_URL = "https://github.com/triton-lang/triton.git"
 SONGDEJUN_FORK_URL = "https://github.com/songdejun/triton.git"
@@ -76,20 +85,11 @@ COMMON_BENCH_ARGS = [
 ]
 
 image = (
-    modal.Image.from_registry(
-        "nvidia/cuda:13.0.3-devel-ubuntu22.04", add_python="3.12"
-    )
+    modal.Image.from_registry("vllm/vllm-openai:latest")
     .apt_install(
         "git", "curl", "ca-certificates", "build-essential", "cmake", "ninja-build",
-        # The prebuilt LLVM package Triton downloads was built with zlib
-        # support, so its CMake export files reference ZLIB::ZLIB. Without
-        # zlib's dev headers, find_package(ZLIB) fails silently (a warning,
-        # not an error) and CMake only hits a hard error later when it
-        # tries to resolve that reference on LLVMSupport/lldELF. libxml2-dev
-        # added proactively for the same reason (same "Could NOT find"
-        # pattern seen for it, even though it didn't trigger the fatal
-        # error this specific run - avoids re-discovering this one file at
-        # a time on a >5-minute-per-attempt build).
+        # Same zlib/libxml2 gap as before - Triton's prebuilt LLVM package
+        # references ZLIB::ZLIB in its CMake export files.
         "zlib1g-dev", "libxml2-dev",
     )
     .pip_install("uv")
@@ -114,9 +114,9 @@ def extract_throughput(log_path: str) -> float:
 def _run_validation(tag: str) -> tuple[bool, dict[str, str]]:
     t0 = time.monotonic()
 
-    # Fresh container has no git identity; the merge below creates a real
-    # commit (not a fast-forward), which git refuses without one. Throwaway
-    # identity, never pushed anywhere.
+    # Fresh container has no git identity; the Triton merge below creates
+    # a real commit (not a fast-forward), which git refuses without one.
+    # Throwaway identity, never pushed anywhere.
     subprocess.run(
         ["git", "config", "--global", "user.email", "modal-ci@example.com"],
         check=True,
@@ -125,60 +125,40 @@ def _run_validation(tag: str) -> tuple[bool, dict[str, str]]:
         ["git", "config", "--global", "user.name", "Modal CI"], check=True
     )
 
-    step("Cloning vLLM PR head", t0, tag)
-    # No --depth here (unlike the other validate scripts' shallow clones):
-    # vLLM's own precompiled-wheel install logic runs `git merge-base`
-    # against the upstream nightly commit to find a compatible wheel. A
-    # shallow clone has no ancestry graph for that to walk, so it silently
-    # falls back to "just grab the nightly wheel regardless of platform" -
-    # which is what broke last run (it grabbed an aarch64-only build on our
-    # x86_64 container). Full history costs a bit more clone time, cheap
-    # relative to the ~30-60min Triton build either way.
+    step("Locating the image's already-installed vLLM", t0, tag)
+    # Deliberately run this *before* cloning our repo into the cwd, so
+    # there's no local vllm/ directory anywhere nearby that could shadow
+    # the real installed package for this lookup itself.
+    find_vllm = subprocess.run(
+        ["python3", "-c", "import vllm, os; print(os.path.dirname(vllm.__file__))"],
+        capture_output=True, text=True, check=True,
+    )
+    installed_vllm_dir = find_vllm.stdout.strip()
+    print(f"Installed vLLM package at: {installed_vllm_dir}")
+
+    step("Cloning vLLM PR branch (just for the kernel file + tests)", t0, tag)
     subprocess.run(
-        ["git", "clone", "--branch", BRANCH, "--single-branch",
+        ["git", "clone", "--branch", BRANCH, "--single-branch", "--depth", "1",
          REPO_URL, "repo"],
         check=True,
     )
 
-    step("Creating venv", t0, tag)
-    subprocess.run(["uv", "venv", "--python", "3.12"], cwd="repo", check=True)
-    # Absolute paths throughout - "triton" is a sibling of "repo", not a
-    # subdirectory, so uv's cwd-relative venv auto-discovery would silently
-    # miss repo/.venv once invoked from cwd="triton".
-    venv_abs = str((Path.cwd() / "repo" / ".venv").resolve())
-    venv_python = str(Path(venv_abs) / "bin" / "python")
-    venv_vllm = str(Path(venv_abs) / "bin" / "vllm")
-    uv_env = {**os.environ, "VIRTUAL_ENV": venv_abs}
+    step("Patching the one changed file into the installed package", t0, tag)
+    src = Path("repo") / KERNEL_REL_PATH
+    dst = Path(installed_vllm_dir) / "v1/attention/ops/triton_unified_attention.py"
+    dst.write_text(src.read_text())
+    print(f"Copied {src} -> {dst}")
 
-    step("Installing vLLM (precompiled)", t0, tag)
-    # Back to VLLM_USE_PRECOMPILED=1: the aarch64-only wheel gap hit
-    # earlier was tied to whatever "latest main" commit existed at that
-    # exact moment - a likely-transient publishing-lag issue, not a
-    # permanent state. Trying this first since it's cheap to check and,
-    # if it works, sidesteps the torch-version-skew source-build problem
-    # entirely (precompiled wheels ship with a tested, compatible torch
-    # already baked in). Falls back to building from source further down
-    # only if this still fails.
-    precompiled_result = subprocess.run(
-        ["uv", "pip", "install", "-e", ".", "--torch-backend=auto"],
-        cwd="repo",
-        env={**uv_env, "VLLM_USE_PRECOMPILED": "1"},
-    )
-    if precompiled_result.returncode != 0:
-        step("Precompiled wheel unavailable again - falling back to "
-             "building vLLM from source", t0, tag)
-        subprocess.run(
-            ["uv", "pip", "install", "-e", ".", "--torch-backend=auto"],
-            cwd="repo",
-            env=uv_env,
-            check=True,
-        )
+    # Delete the clone's local vllm/ source tree entirely now that we've
+    # taken the one file we needed from it - guarantees nothing below can
+    # ever shadow-import it instead of the patched, installed package.
+    subprocess.run(["rm", "-rf", "repo/vllm"], check=True)
 
-    step("Installing test requirements", t0, tag)
+    step("Installing minimal test deps (pytest only - avoid disturbing "
+         "the base image's already-working torch/vllm-flash-attn combo "
+         "by reinstalling the full test requirements file)", t0, tag)
     subprocess.run(
-        ["uv", "pip", "install", "-r", "requirements/test/cuda.in"],
-        cwd="repo",
-        env=uv_env,
+        ["uv", "pip", "install", "--system", "pytest", "pytest-asyncio"],
         check=True,
     )
 
@@ -206,27 +186,28 @@ def _run_validation(tag: str) -> tuple[bool, dict[str, str]]:
     step("Building Triton from source (LLVM build - this is the long part)",
          t0, tag)
     subprocess.run(
-        ["uv", "pip", "install", "-e", ".", "-v"],
+        ["uv", "pip", "install", "--system", "-e", ".", "-v"],
         cwd="triton",
-        env=uv_env,
         check=True,
     )
 
-    step("Verifying which Triton actually got installed", t0, tag)
+    step("Verifying which Triton actually got installed, and that vLLM "
+         "still imports the patched kernel file", t0, tag)
     subprocess.run(
-        [venv_python, "-c",
-         "import triton, subprocess; "
+        ["python3", "-c",
+         "import triton, vllm, subprocess; "
          "print('triton module path:', triton.__file__); "
          "print('triton version:', triton.__version__); "
          "print('HEAD in that checkout:', subprocess.run("
          "['git', 'rev-parse', 'HEAD'], cwd='triton', "
-         "capture_output=True, text=True).stdout.strip())"],
+         "capture_output=True, text=True).stdout.strip()); "
+         "print('vllm module path:', vllm.__file__)"],
         check=True,
     )
 
     step("Correctness sanity check", t0, tag)
     subprocess.run(
-        f"{venv_python} -m pytest "
+        f"python3 -m pytest "
         f"tests/kernels/attention/test_triton_unified_attention.py "
         f"-k use_td -x -v 2>&1 | tee /tmp/{tag}_correctness_use_td.log",
         shell=True,
@@ -247,12 +228,11 @@ def _run_validation(tag: str) -> tuple[bool, dict[str, str]]:
              t0, tag)
         log_path = f"/tmp/{tag}_bench_balanced_td_off_rep{rep}.log"
         subprocess.run(
-            f"{venv_vllm} bench throughput "
+            f"vllm bench throughput "
             + " ".join(COMMON_BENCH_ARGS)
             + f" 2>&1 | tee {log_path}",
             shell=True,
-            cwd="repo",
-            env={**uv_env, "VLLM_TRITON_USE_TD": "0"},
+            env={**os.environ, "VLLM_TRITON_USE_TD": "0"},
             check=True,
         )
         off_throughputs.append(extract_throughput(log_path))
@@ -261,12 +241,11 @@ def _run_validation(tag: str) -> tuple[bool, dict[str, str]]:
              f"songdejun's Triton)", t0, tag)
         log_path = f"/tmp/{tag}_bench_balanced_td_on_rep{rep}.log"
         subprocess.run(
-            f"{venv_vllm} bench throughput "
+            f"vllm bench throughput "
             + " ".join(COMMON_BENCH_ARGS)
             + f" 2>&1 | tee {log_path}",
             shell=True,
-            cwd="repo",
-            env={**uv_env, "VLLM_TRITON_USE_TD": "1"},
+            env={**os.environ, "VLLM_TRITON_USE_TD": "1"},
             check=True,
         )
         on_throughputs.append(extract_throughput(log_path))
