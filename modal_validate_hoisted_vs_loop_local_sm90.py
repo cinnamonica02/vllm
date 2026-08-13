@@ -100,18 +100,21 @@ def run_bench(variant: str, rep: int, t0: float) -> float:
     return extract_throughput(log_path)
 
 
-def run_correctness(variant: str, t0: float) -> str:
+def run_correctness(variant: str, t0: float) -> tuple[bool, str]:
     log_path = f"/tmp/correctness_{variant}.log"
     step(f"Correctness ({variant})", t0)
-    subprocess.run(
+    # Not check=True: loop-local genuinely can fail to compile at all (a
+    # real MLIR pipeliner failure, not a script bug - confirmed once
+    # already). That's a valid result to record, not something that
+    # should crash the whole run before we get to test the other variant.
+    result = subprocess.run(
         ["bash", "-c",
          "set -o pipefail && python3 -m pytest "
          "tests/kernels/attention/test_triton_unified_attention.py "
          f"-k use_td -x -v 2>&1 | tee {log_path}"],
         cwd="repo",
-        check=True,
     )
-    return Path(log_path).read_text()
+    return result.returncode == 0, Path(log_path).read_text()
 
 
 @app.function(gpu="H200", timeout=3600)
@@ -172,7 +175,16 @@ def run_validation() -> dict[str, str]:
         step(f"Patching in {variant} kernel", t0)
         dst.write_text(src)
 
-        results[f"correctness_{variant}"] = run_correctness(variant, t0)
+        passed, correctness_log = run_correctness(variant, t0)
+        results[f"correctness_{variant}"] = correctness_log
+
+        if not passed:
+            msg = (f"{variant}: correctness FAILED (compile or runtime "
+                   f"error) - skipping throughput, nothing to benchmark "
+                   f"if it doesn't run. See correctness_{variant}.log.\n")
+            results[f"summary_{variant}"] = msg
+            print(msg)
+            continue
 
         throughputs = [run_bench(variant, rep, t0) for rep in range(1, 4)]
         summary = (
