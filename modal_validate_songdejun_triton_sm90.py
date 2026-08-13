@@ -54,6 +54,7 @@ Usage:
 
 import os
 import re
+import shlex
 import statistics
 import subprocess
 import time
@@ -261,7 +262,13 @@ def _run_validation(tag: str) -> tuple[bool, dict[str, str]]:
         log_path = f"/tmp/{tag}_bench_balanced_td_off_rep{rep}.log"
         subprocess.run(
             f"vllm bench throughput "
-            + " ".join(COMMON_BENCH_ARGS)
+            # shlex.quote, not a plain join: shell=True means /bin/sh
+            # re-parses this whole string, and would strip the double
+            # quotes out of --attention-config's JSON value as its own
+            # quoting syntax before vllm ever sees it (confirmed - that's
+            # exactly what broke last run, '{"backend":"TRITON_ATTN"}'
+            # arrived as the mangled {backend:TRITON_ATTN}).
+            + " ".join(shlex.quote(a) for a in COMMON_BENCH_ARGS)
             + f" 2>&1 | tee {log_path}",
             shell=True,
             env={**os.environ, "VLLM_TRITON_USE_TD": "0"},
@@ -274,7 +281,13 @@ def _run_validation(tag: str) -> tuple[bool, dict[str, str]]:
         log_path = f"/tmp/{tag}_bench_balanced_td_on_rep{rep}.log"
         subprocess.run(
             f"vllm bench throughput "
-            + " ".join(COMMON_BENCH_ARGS)
+            # shlex.quote, not a plain join: shell=True means /bin/sh
+            # re-parses this whole string, and would strip the double
+            # quotes out of --attention-config's JSON value as its own
+            # quoting syntax before vllm ever sees it (confirmed - that's
+            # exactly what broke last run, '{"backend":"TRITON_ATTN"}'
+            # arrived as the mangled {backend:TRITON_ATTN}).
+            + " ".join(shlex.quote(a) for a in COMMON_BENCH_ARGS)
             + f" 2>&1 | tee {log_path}",
             shell=True,
             env={**os.environ, "VLLM_TRITON_USE_TD": "1"},
