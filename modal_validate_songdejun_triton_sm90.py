@@ -207,8 +207,18 @@ def _run_validation(tag: str) -> tuple[bool, dict[str, str]]:
 
     step("Building Triton from source (LLVM build - this is the long part)",
          t0, tag)
+    # Not -e (editable): setuptools' modern PEP 660 editable-install
+    # mechanism (a "meta path finder") doesn't correctly expose all of
+    # Triton's nested subpackages - confirmed by a prior run where
+    # `import triton` succeeded but `triton.language` raised
+    # AttributeError, breaking torch/vllm's own import chain (torch._
+    # dynamo touches triton.language.dtype at import time). We don't need
+    # editable mode here anyway - not iterating on Triton's source live,
+    # just building it once. A regular install actually materializes the
+    # discovered files into site-packages instead of relying on that
+    # finder.
     subprocess.run(
-        ["uv", "pip", "install", "--system", "-e", ".", "-v"],
+        ["uv", "pip", "install", "--system", ".", "-v"],
         cwd="triton",
         check=True,
     )
