@@ -92,7 +92,11 @@ image = (
         # references ZLIB::ZLIB in its CMake export files.
         "zlib1g-dev", "libxml2-dev",
     )
-    .pip_install("uv")
+    # Not .pip_install("uv"): that helper shells out to plain `python`,
+    # which doesn't exist on this base image (only `python3` is on PATH),
+    # and fails with "python: not found". Explicit python3 invocation
+    # instead.
+    .run_commands("python3 -m pip install uv")
 )
 
 app = modal.App("vllm-songdejun-triton-multi-gpu-validate", image=image)
