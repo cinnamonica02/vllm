@@ -86,6 +86,14 @@ COMMON_BENCH_ARGS = [
 
 image = (
     modal.Image.from_registry("vllm/vllm-openai:latest")
+    # vllm-openai's image bakes in a Docker ENTRYPOINT that treats every
+    # arg as a `vllm` CLI argument (it's designed to run as a turnkey
+    # server container). That swallows Modal's own container bootstrap
+    # command (`python -u -R ... -m modal._container_entrypoint ...`),
+    # handing it to `vllm` as arguments instead of actually running
+    # Python - hence "vllm: error: unrecognized arguments: -u -R ...".
+    # Clearing it restores normal exec behavior for Modal's own startup.
+    .dockerfile_commands(["ENTRYPOINT []"])
     .apt_install(
         "git", "curl", "ca-certificates", "build-essential", "cmake", "ninja-build",
         # Same zlib/libxml2 gap as before - Triton's prebuilt LLVM package
