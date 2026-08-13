@@ -311,7 +311,17 @@ def main():
     h200_call = run_h200.spawn()
     b200_call = run_b200.spawn()
 
-    results = {"h200": h200_call.get(), "b200": b200_call.get()}
+    # Each .get() in its own try/except: a plain dict literal would abort
+    # entirely on the first failed .get(), losing the other GPU's result
+    # even if it succeeded - independent containers, so one failing
+    # shouldn't hide the other's outcome.
+    results: dict[str, tuple[bool, dict[str, str]]] = {}
+    for gpu_tag, call in [("h200", h200_call), ("b200", b200_call)]:
+        try:
+            results[gpu_tag] = call.get()
+        except Exception as e:
+            print(f"\n[{gpu_tag}] FAILED: {e}")
+            results[gpu_tag] = (False, {})
 
     print("\n" + "=" * 60)
     print("SUMMARY (median [min, max] over 3 interleaved reps)")
