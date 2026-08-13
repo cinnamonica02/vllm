@@ -91,6 +91,16 @@ image = (
         # Same zlib/libxml2 gap as before - Triton's prebuilt LLVM package
         # references ZLIB::ZLIB in its CMake export files.
         "zlib1g-dev", "libxml2-dev",
+        # Adds the conventional /usr/bin/python -> python3 symlink. This
+        # image only ships python3, which breaks more than just our own
+        # `python -m pip` calls below - Modal's own SDK probes for a
+        # `python` binary to determine the image's interpreter version
+        # when building a Function from a custom registry image, and
+        # fails with a platform-level ConflictError if it can't find one.
+        # A real symlink to the existing interpreter, not a second Python
+        # install - doesn't risk losing access to the image's
+        # pre-installed vLLM/torch.
+        "python-is-python3",
     )
     # Not .pip_install("uv"): that helper shells out to plain `python`,
     # which doesn't exist on this base image (only `python3` is on PATH),
